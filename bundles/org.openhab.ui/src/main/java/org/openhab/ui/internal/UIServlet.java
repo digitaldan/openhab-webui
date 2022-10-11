@@ -13,12 +13,12 @@
 package org.openhab.ui.internal;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.net.URL;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
+import java.util.Hashtable;
+import java.util.List;
 import java.util.Map;
 
 import javax.servlet.ServletException;
@@ -27,28 +27,34 @@ import javax.servlet.http.HttpServletResponse;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
+import org.eclipse.jetty.http.CompressedContentFormat;
+import org.eclipse.jetty.server.ResourceService;
+import org.eclipse.jetty.server.handler.ContextHandler;
+import org.eclipse.jetty.servlet.DefaultServlet;
+import org.eclipse.jetty.util.resource.Resource;
 import org.openhab.core.OpenHAB;
-import org.openhab.core.io.http.servlet.OpenHABServlet;
 import org.osgi.service.component.annotations.Activate;
 import org.osgi.service.component.annotations.Component;
 import org.osgi.service.component.annotations.Deactivate;
 import org.osgi.service.component.annotations.Reference;
 import org.osgi.service.http.HttpContext;
 import org.osgi.service.http.HttpService;
+import org.osgi.service.http.NamespaceException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Servlet that serves files from both the filesystem and the local bundle. Supports general file caching using either
- * the last modified time of the file, or the startup time of this service.
+ * Servlet that serves files from both the filesystem and the local bundle. Supports general file caching as well as
+ * serving compressed files
  *
  * @author Dan Cunningham - Initial contribution
  */
+
 @Component(immediate = true, name = "org.openhab.ui", property = { "httpContext.id:String=oh-ui-http-ctx" })
 @NonNullByDefault
-public class UIServlet extends OpenHABServlet {
+public class UIServlet extends DefaultServlet {
 
-    private static final long serialVersionUID = 2880642275858634578L;
+    private static final long serialVersionUID = 1L;
 
     private final Logger logger = LoggerFactory.getLogger(UIServlet.class);
 
@@ -57,133 +63,97 @@ public class UIServlet extends OpenHABServlet {
     private static final String STATIC_PATH = "/static";
     private static final String STATIC_BASE = OpenHAB.getConfigFolder() + "/html";
 
-    private long startupTime;
     private final HttpContext defaultHttpContext;
+    private final HttpService httpService;
+    private final ContextHandler contextHandler;
+    private static final ResourceService resourceService = new ResourceService();
+
+    static {
+        resourceService.setAcceptRanges(true);
+        resourceService.setDirAllowed(false);
+        resourceService.setRedirectWelcome(false);
+        List<CompressedContentFormat> ccf = new ArrayList<>();
+        ccf.add(CompressedContentFormat.BR);
+        ccf.add(CompressedContentFormat.GZIP);
+        resourceService.setPrecompressedFormats(ccf.toArray(new CompressedContentFormat[ccf.size()]));
+        // _resourceService.setPathInfoOnly(getInitBoolean("pathInfoOnly", _resourceService.isPathInfoOnly()));
+        resourceService.setEtags(true);
+    }
 
     @Activate
     public UIServlet(final @Reference HttpService httpService, final @Reference HttpContext httpContext) {
-        super(httpService, httpContext);
+        super(resourceService);
         defaultHttpContext = httpService.createDefaultHttpContext();
+        this.httpService = httpService;
+        contextHandler = ContextHandler.getCurrentContext().getContextHandler();
     }
 
     @Activate
     protected void activate(Map<String, Object> config) {
-        super.activate(SERVLET_NAME);
-        startupTime = roundDownMillisconds(System.currentTimeMillis());
+        try {
+            logger.debug("Starting up {} at {}", getClass().getSimpleName(), SERVLET_NAME);
+            httpService.registerServlet(SERVLET_NAME, this, new Hashtable<>(), defaultHttpContext);
+        } catch (NamespaceException e) {
+            logger.error("Error during servlet registration - alias {} already in use", SERVLET_NAME, e);
+        } catch (ServletException e) {
+            logger.error("Error during servlet registration", e);
+        }
     }
 
     @Deactivate
     protected void deactivate() {
-        super.deactivate(SERVLET_NAME);
+        httpService.unregister(SERVLET_NAME);
     }
 
     @Override
-    protected void doGet(@Nullable HttpServletRequest req, @Nullable HttpServletResponse resp)
-            throws ServletException, IOException {
-        if (req == null || resp == null) {
-            return;
+    public @Nullable Resource getResource(@Nullable String path) {
+        logger.debug("getResource: {}", path);
+        if (path == null) {
+            return null;
         }
-
-        if (!defaultHttpContext.handleSecurity(req, resp)) {
-            resp.sendError(HttpServletResponse.SC_FORBIDDEN);
-        }
-
-        String reqPath = req.getRequestURI();
-        logger.debug("Request Path {}", reqPath);
-
-        if (reqPath == null) {
-            logger.debug("Cannot service a request without a URI");
-            resp.sendError(HttpServletResponse.SC_NOT_FOUND);
-            return;
-        }
-
-        String mimeType = getServletContext().getMimeType(reqPath);
-
-        if (reqPath.startsWith(STATIC_PATH)) {
-            if (reqPath.endsWith("/")) {
-                // we only serve files
-                resp.sendError(HttpServletResponse.SC_NOT_FOUND);
-                return;
-            }
-
-            // Files are served from the user 'html' folder
-            Path path = Paths.get(STATIC_BASE + reqPath.substring(new String(STATIC_PATH).length()));
-            logger.debug("Path {} and type {}", path, mimeType);
+        if (path.startsWith(STATIC_PATH)) {
+            Path filePath = Paths.get(STATIC_BASE + path.substring(new String(STATIC_PATH).length()));
+            logger.debug("Local File Path {}", filePath);
 
             // protect against traversal attacks
-            String normalized = path.normalize().toString();
+            String normalized = filePath.normalize().toString();
             if (!normalized.startsWith(STATIC_BASE)) {
                 logger.debug("Request attempted to access a file outside of the user folder");
-                resp.sendError(HttpServletResponse.SC_NOT_FOUND);
-                return;
+                return null;
             }
-
-            if (!Files.exists(path)) {
-                resp.sendError(HttpServletResponse.SC_NOT_FOUND);
-                return;
-            }
-
-            BasicFileAttributes attr = Files.readAttributes(path, BasicFileAttributes.class);
-            long modifiedTime = roundDownMillisconds(attr.lastModifiedTime().toMillis());
-            if (!modifiedSince(req, modifiedTime)) {
-                resp.setStatus(HttpServletResponse.SC_NOT_MODIFIED);
-                return;
-            }
-
-            try (InputStream is = Files.newInputStream(path)) {
-                resp.setContentType(mimeType);
-                resp.setDateHeader("Last-Modified", modifiedTime);
-                is.transferTo(resp.getOutputStream());
-                resp.flushBuffer();
+            try {
+                return contextHandler.newResource(filePath.toUri());
             } catch (IOException e) {
-                logger.error("Failed sending the file stream as a response: {}", e.getMessage());
-                resp.sendError(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, e.getMessage());
+                logger.debug("Could not load resource", e);
+                return null;
             }
         } else {
-            if (!modifiedSinceStartup(req)) {
-                resp.setStatus(HttpServletResponse.SC_NOT_MODIFIED);
-                return;
-            }
-
             // we don't serve directories, try loading an index page for that
-            String modifiedReqPath = reqPath.endsWith("/") ? reqPath + "index.html" : reqPath;
+            String modifiedReqPath = path.endsWith("/") ? path + "index.html" : path;
             URL url = defaultHttpContext.getResource(APP_BASE + modifiedReqPath);
 
             // The Main UI Vue.js app has its own router, so return the base page and let it deal with unknown paths.
             url = (url != null) ? url : defaultHttpContext.getResource(APP_BASE + "/index.html");
-
-            logger.debug("Bundle path URL {}", url);
-
-            if (url == null) {
-                resp.sendError(HttpServletResponse.SC_NOT_FOUND);
-                return;
-            }
-
-            try (InputStream is = url.openStream()) {
-                resp.setContentType(mimeType);
-                resp.setDateHeader("Last-Modified", startupTime);
-                is.transferTo(resp.getOutputStream());
-                resp.flushBuffer();
+            logger.debug("Bundle File Path {}", url);
+            try {
+                return contextHandler.newResource(url);
             } catch (IOException e) {
-                logger.error("Failed sending the file stream as a response: {}", e.getMessage());
-                resp.sendError(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, e.getMessage());
+                logger.debug("Could not load resource", e);
+                return null;
             }
         }
     }
 
-    private boolean modifiedSinceStartup(HttpServletRequest req) {
-        return modifiedSince(req, startupTime);
-    }
-
-    private boolean modifiedSince(HttpServletRequest req, long lastModified) {
-        long modifiedSince = req.getDateHeader("If-Modified-Since");
-        logger.debug("If-Modified-Since : {} file time {} is modified  {}", modifiedSince, lastModified,
-                modifiedSince < lastModified);
-        return modifiedSince < lastModified;
-    }
-
-    // "If-Modified-Since" uses seconds level precision, drop the last milliseconds
-    private long roundDownMillisconds(long milliseconds) {
-        return (milliseconds / 1000) * 1000;
+    @Override
+    protected void doGet(@Nullable HttpServletRequest request, @Nullable HttpServletResponse response)
+            throws ServletException, IOException {
+        if (request == null || response == null) {
+            return;
+        }
+        if (!defaultHttpContext.handleSecurity(request, response)) {
+            response.sendError(HttpServletResponse.SC_FORBIDDEN);
+            return;
+        }
+        super.doGet(request, response);
     }
 }
