@@ -13,22 +13,18 @@
 package org.openhab.ui.internal;
 
 import java.io.IOException;
+import java.net.MalformedURLException;
 import java.net.URL;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.ArrayList;
 import java.util.Hashtable;
-import java.util.List;
 import java.util.Map;
 
 import javax.servlet.ServletException;
+import javax.servlet.UnavailableException;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
-import org.eclipse.jetty.http.CompressedContentFormat;
-import org.eclipse.jetty.server.ResourceService;
 import org.eclipse.jetty.server.handler.ContextHandler;
 import org.eclipse.jetty.servlet.DefaultServlet;
 import org.eclipse.jetty.util.resource.Resource;
@@ -47,7 +43,8 @@ import org.slf4j.LoggerFactory;
  * Servlet that serves files from both the filesystem and the local bundle. Supports general file caching as well as
  * serving compressed files
  *
- * @author Dan Cunningham - Initial contribution
+ * @author Yannick Schaus - Initial contribution
+ * @author Dan Cunningham - Convert file serving to a custom servlet
  */
 
 @Component(immediate = true, name = "org.openhab.ui", property = { "httpContext.id:String=oh-ui-http-ctx" })
@@ -65,27 +62,13 @@ public class UIServlet extends DefaultServlet {
 
     private final HttpContext defaultHttpContext;
     private final HttpService httpService;
-    private final ContextHandler contextHandler;
-    private static final ResourceService resourceService = new ResourceService();
-
-    static {
-        resourceService.setAcceptRanges(true);
-        resourceService.setDirAllowed(false);
-        resourceService.setRedirectWelcome(false);
-        List<CompressedContentFormat> ccf = new ArrayList<>();
-        ccf.add(CompressedContentFormat.BR);
-        ccf.add(CompressedContentFormat.GZIP);
-        resourceService.setPrecompressedFormats(ccf.toArray(new CompressedContentFormat[ccf.size()]));
-        // _resourceService.setPathInfoOnly(getInitBoolean("pathInfoOnly", _resourceService.isPathInfoOnly()));
-        resourceService.setEtags(true);
-    }
+    private @Nullable ContextHandler contextHandler;
 
     @Activate
     public UIServlet(final @Reference HttpService httpService, final @Reference HttpContext httpContext) {
-        super(resourceService);
+        super();
         defaultHttpContext = httpService.createDefaultHttpContext();
         this.httpService = httpService;
-        contextHandler = ContextHandler.getCurrentContext().getContextHandler();
     }
 
     @Activate
@@ -106,43 +89,46 @@ public class UIServlet extends DefaultServlet {
     }
 
     @Override
-    public @Nullable Resource getResource(@Nullable String path) {
-        logger.debug("getResource: {}", path);
-        if (path == null) {
+    public void init() throws UnavailableException {
+        setInitParameter("acceptRanges", "true");
+        setInitParameter("dirAllowed", "false");
+        setInitParameter("redirectWelcome", "false");
+        setInitParameter("precompressed", "true");
+        setInitParameter("etags", "true");
+        contextHandler = ContextHandler.getCurrentContext().getContextHandler();
+        super.init();
+    }
+
+    @Override
+    public @Nullable Resource getResource(@NonNullByDefault({}) String name) {
+        logger.debug("getResource: {}", name);
+        ContextHandler contextHandler = this.contextHandler;
+        if (contextHandler == null) {
             return null;
         }
-        if (path.startsWith(STATIC_PATH)) {
-            Path filePath = Paths.get(STATIC_BASE + path.substring(new String(STATIC_PATH).length()));
-            logger.debug("Local File Path {}", filePath);
-
-            // protect against traversal attacks
-            String normalized = filePath.normalize().toString();
-            if (!normalized.startsWith(STATIC_BASE)) {
-                logger.debug("Request attempted to access a file outside of the user folder");
-                return null;
-            }
+        URL url = null;
+        if (name.startsWith(STATIC_PATH) && !name.endsWith("/")) {
             try {
-                return contextHandler.newResource(filePath.toUri());
-            } catch (IOException e) {
-                logger.debug("Could not load resource", e);
-                return null;
+                url = new java.io.File(STATIC_BASE + name.substring(new String(STATIC_PATH).length())).toURI().toURL();
+                logger.trace("Serving static file from {}", url);
+            } catch (MalformedURLException e) {
+                logger.error("Error while serving static content: {}", e.getMessage());
+                url = defaultHttpContext.getResource(name);
             }
         } else {
-            // we don't serve directories, try loading an index page for that
-            String modifiedReqPath = path.endsWith("/") ? path + "index.html" : path;
-            URL url = defaultHttpContext.getResource(APP_BASE + modifiedReqPath);
-
-            // The Main UI Vue.js app has its own router, so return the base page and let it deal with unknown paths.
-            url = (url != null) ? url : defaultHttpContext.getResource(APP_BASE + "/index.html");
-            logger.debug("Bundle File Path {}", url);
-            try {
-                return contextHandler.newResource(url);
-            } catch (IOException e) {
-                logger.debug("Could not load resource", e);
-                return null;
-            }
+            // for directories, serve the index page and let Vue.js routing handle it
+            String bundlePath = "/".equals(name) ? "/index.html" : name;
+            url = defaultHttpContext.getResource(APP_BASE + bundlePath);
+        }
+        try {
+            logger.debug("getResource returning {}", url);
+            return contextHandler.newResource(url);
+        } catch (IOException e) {
+            logger.error("Error while serving content: {}", e.getMessage());
+            return null;
         }
     }
+    // return ContextHandler.getCurrentContext().getContextHandler().newResource(url);
 
     @Override
     protected void doGet(@Nullable HttpServletRequest request, @Nullable HttpServletResponse response)
@@ -155,5 +141,10 @@ public class UIServlet extends DefaultServlet {
             return;
         }
         super.doGet(request, response);
+    }
+
+    private void setInitParameter(String name, String value) {
+        getServletContext().setInitParameter(CONTEXT_INIT + name, value);
+
     }
 }

@@ -8,6 +8,7 @@ const TerserPlugin = require('terser-webpack-plugin')
 const WorkboxPlugin = require('workbox-webpack-plugin')
 const WebpackAnalyzerPlugin = require('webpack-bundle-analyzer').BundleAnalyzerPlugin
 const ESLintPlugin = require('eslint-webpack-plugin');
+const CompressionPlugin = require('compression-webpack-plugin')
 
 const path = require('path')
 
@@ -236,6 +237,23 @@ module.exports = {
         swSrc: resolvePath('src/service-worker.js')
       })
     ] : []),
+     new CompressionPlugin({
+      filename: '[path][base].gz',
+      algorithm: 'gzip',
+      test: /\.js$|\.css$|\.html$/,
+      threshold: 0,
+      minRatio: Infinity,
+    }),
+    new CompressionPlugin({
+      filename: '[path][base].br',
+      algorithm: 'brotliCompress',
+      test: /\.(js|css|html|svg)$/,
+      compressionOptions: {
+        level: 11,
+      },
+      threshold: 0,
+      minRatio: Infinity,
+    }),
     ...(process.env.WEBPACK_ANALYZER ? [
       new WebpackAnalyzerPlugin(process.env.WEBPACK_ANALYZER_REPORT ? {
         analyzerMode: 'static',
